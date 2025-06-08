@@ -199,6 +199,8 @@ class Linkedin(object):
         evade()
 
         url = f"{self.client.API_BASE_URL if not base_request else self.client.LINKEDIN_BASE_URL}{uri}"
+        if self.proxy_config:
+            kwargs['proxies'] = self.proxy_config  # Apply proxy with authentication
         headers = self.custom_headers or self.client.REQUEST_HEADERS
         return self.client.session.post(url, headers=headers, **kwargs)
     def safe_split_urn(self,urn, delimiter=':', default=''):
