@@ -63,11 +63,24 @@ class Linkedin(object):
         authenticate=True,
         refresh_cookies=False,
         debug=False,
-        proxies={},
+       proxy: Optional[str] = None,
         cookies=None,
         cookies_dir: str = "",
         headers: Optional[Dict[str, str]] = None,
     ):
+        proxy_config = {}
+        if proxy:
+            try:
+                # Expected format: host:port:username:password
+                parts = proxy.split(':')
+                if len(parts) == 4:
+                    host, port, username, password = parts
+                    proxy_url = f"http://{username}:{password}@{host}:{port}"
+                    proxy_config = {'http': proxy_url, 'https': proxy_url}
+                else:
+                    logger.error("Invalid proxy format. Expected 'host:port:username:password'")
+            except Exception as e:
+                logger.error(f"Error parsing proxy string: {e}")
         """Constructor method"""
         self.client = Client(
             refresh_cookies=refresh_cookies,
@@ -79,6 +92,8 @@ class Linkedin(object):
         self.logger = logger
 
         self.custom_headers = headers  # Store custom headers
+      
+
 
         if headers:
             # Skip authentication and cookie checks if headers are provided
@@ -98,6 +113,9 @@ class Linkedin(object):
         evade()
 
         url = f"{self.client.API_BASE_URL if not base_request else self.client.LINKEDIN_BASE_URL}{uri}"
+        headers = self.custom_headers or self.client.REQUEST_HEADERS
+        if self.proxy_config:
+            kwargs['proxies'] = self.proxy_config  # Apply proxy with authentication
         headers = self.custom_headers or self.client.REQUEST_HEADERS
         return self.client.session.get(url, headers=headers, **kwargs)
 
