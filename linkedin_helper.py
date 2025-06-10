@@ -1105,6 +1105,249 @@ class Linkedin(object):
         profile=self.extract_linkedin_profile(data)
 
         return profile
+    def extract_linkedin_profile_without(self, json_data):
+        """
+        Extracts detailed LinkedIn profile information from JSON data, including IDs.
+        Returns a dictionary with profile details, experience, education, certifications, skills, image, and more.
+        """
+        result = {
+            'profile_details': {},
+            'experience': [],
+            'education': [],
+            'certifications': [],
+            'skills': [],
+            'image': '',
+            'honors': [],
+            'test_scores': [],
+            'languages': [],
+            'volunteer_experiences': [],
+            'projects': [],
+            'publications': [],
+            'courses': []
+        }
+
+        included = json_data.get('included', [])
+        # # Extract paging for experiences and skills
+        # position_view = [item for item in included if
+        #                  item.get('$type') == 'com.linkedin.voyager.identity.profile.PositionView']
+        # skill_view = [item for item in included if
+        #               item.get('$type') == 'com.linkedin.voyager.identity.profile.SkillView']
+        #
+        # fetch_more_experiences = False
+        # fetch_more_skills = False
+        # profile_id_for_fetch = None
+        #
+        # # for item in position_view:
+        # #     count = self.safe_get(item, 'paging', 'count', default=0)
+        # #     total = self.safe_get(item, 'paging', 'total', default=0)
+        # #     profile_id = self.safe_get(item, 'profileId', default='')
+        # #     if count < total and profile_id:
+        # #         fetch_more_experiences = True
+        # #         profile_id_for_fetch = profile_id
+        # #
+        # # for item in skill_view:
+        # #     count = self.safe_get(item, 'paging', 'count', default=0)
+        # #     total = self.safe_get(item, 'paging', 'total', default=0)
+        # #     profile_id = self.safe_get(item, 'profileId', default='')
+        # #     if count < total and profile_id:
+        # #         fetch_more_skills = True
+        # #         profile_id_for_fetch = profile_id
+
+        for item in included:
+            item_type = self.safe_get(item, '$type', default='')
+
+            if item_type == 'com.linkedin.voyager.identity.profile.Profile':
+                result['profile_details'] = {
+                    'linkedInIdentifier': self.safe_split_urn(self.safe_get(item, 'entityUrn')),
+                    'first_name': self.safe_get(item, 'firstName'),
+                    'last_name': self.safe_get(item, 'lastName'),
+                    'headline': self.safe_get(item, 'headline'),
+                    'summary': self.safe_get(item, 'summary'),
+                    'location': self.safe_get(item, 'locationName'),
+                    'industry': self.safe_get(item, 'industryName'),
+                    'address': self.safe_get(item, 'address'),
+                    'geo_location': self.safe_get(item, 'geoLocationName'),
+                    'geo_country': self.safe_get(item, 'geoCountryName'),
+                    'entity_urn': self.safe_get(item, 'entityUrn'),
+                    'openToWork': self.safe_get(item, 'elt'),
+                }
+
+            elif item_type == 'com.linkedin.voyager.identity.profile.Position':
+                start_date = self.safe_get(item, 'timePeriod', 'startDate', default={})
+                end_date = self.safe_get(item, 'timePeriod', 'endDate', default={})
+                company = self.safe_get(item, 'company', default={})
+                experience = {
+                    'title': self.safe_get(item, 'title'),
+                    'company': self.safe_get(item, 'companyName'),
+                    'company_id': self.safe_split_urn(self.safe_get(item, 'companyUrn')),
+                    'company_linked': f"https://linkedin.com/company/{self.safe_split_urn(self.safe_get(item, 'companyUrn'))}",
+                    'location': self.safe_get(item, 'locationName'),
+                    'geo_location': self.safe_get(item, 'geoLocationName'),
+                    'start_date': f"{self.safe_get(start_date, 'month')}/{self.safe_get(start_date, 'year')}" if start_date else '',
+                    'end_date': f"{self.safe_get(end_date, 'month')}/{self.safe_get(end_date, 'year')}" if end_date else 'Present',
+                    'description': self.safe_get(item, 'description'),
+                    'industries': self.safe_get(company, 'industries', default=[]),
+                    'entity_urn': self.safe_get(item, 'entityUrn'),
+                    'employee_count_range': self.safe_get(company, 'employeeCountRange', 'start', default=None),
+                }
+                result['experience'].append(experience)
+
+            elif item_type == 'com.linkedin.voyager.identity.profile.Education':
+                time_period = self.safe_get(item, 'timePeriod', default={})
+                education = {
+                    'school': self.safe_get(item, 'schoolName'),
+                    'school_id': self.safe_split_urn(self.safe_get(item, 'schoolUrn')),
+                    'degree': self.safe_get(item, 'degreeName'),
+                    'field_of_study': self.safe_get(item, 'fieldOfStudy'),
+                    'field_of_study_urn': self.safe_get(item, 'fieldOfStudyUrn'),
+                    'degree_urn': self.safe_get(item, 'degreeUrn'),
+                    'start_year': self.safe_get(time_period, 'startDate', 'year'),
+                    'end_year': self.safe_get(time_period, 'endDate', 'year'),
+                    'description': self.safe_get(item, 'description'),
+                    'activities': self.safe_get(item, 'activities'),
+                    'entity_urn': self.safe_get(item, 'entityUrn'),
+                }
+                result['education'].append(education)
+
+            elif item_type == 'com.linkedin.voyager.identity.profile.Certification':
+                start_date = self.safe_get(item, 'timePeriod', 'startDate', default={})
+                certification = {
+                    'name': self.safe_get(item, 'name'),
+                    'authority': self.safe_get(item, 'authority'),
+                    'issued': f"{self.safe_get(start_date, 'month')}/{self.safe_get(start_date, 'year')}" if start_date else '',
+                    'url': self.safe_get(item, 'url'),
+                    'license_number': self.safe_get(item, 'licenseNumber'),
+                    'display_source': self.safe_get(item, 'displaySource'),
+                    'company_id': self.safe_split_urn(self.safe_get(item, 'companyUrn')),
+                    'company_linked': f"https://linkedin.com/company/{self.safe_split_urn(self.safe_get(item, 'companyUrn'))}",
+                    'entity_urn': self.safe_get(item, 'entityUrn'),
+                }
+                result['certifications'].append(certification)
+
+            elif item_type == 'com.linkedin.voyager.identity.profile.Skill':
+                skill = {
+                    'name': self.safe_get(item, 'name'),
+                    'standardized_skill_urn': self.safe_get(item, 'standardizedSkillUrn'),
+                }
+                result['skills'].append(skill)
+
+            elif item_type == 'com.linkedin.voyager.identity.shared.MiniProfile':
+                picture = self.safe_get(item, 'picture', default={})
+                artifacts = self.safe_get(picture, 'artifacts', default=[])
+                if artifacts:
+                    largest = max(artifacts, key=lambda x: self.safe_get(x, 'width', default=0))
+                    result['image'] = self.safe_get(picture, 'rootUrl', default='') + self.safe_get(largest,
+                                                                                          'fileIdentifyingUrlPathSegment',
+                                                                                          default='')
+                result['profile_details'].update({
+                    'publicIdentifier': self.safe_get(item, 'publicIdentifier'),
+                    'tracking_id': self.safe_get(item, 'trackingId'),
+                    'memberIdentifier': self.safe_split_urn(self.safe_get(item, 'objectUrn')),
+                })
+
+            elif item_type == 'com.linkedin.voyager.identity.profile.Honor':
+                honor = {
+                    'title': self.safe_get(item, 'title'),
+                    'issuer': self.safe_get(item, 'issuer'),
+                    'date': self.safe_get(item, 'issueDate'),
+                    'entity_urn': self.safe_get(item, 'entityUrn'),
+                }
+                result['honors'].append(honor)
+
+            elif item_type == 'com.linkedin.voyager.identity.profile.TestScore':
+                test_score = {
+                    'name': self.safe_get(item, 'name'),
+                    'score': self.safe_get(item, 'score'),
+                    'description': self.safe_get(item, 'description'),
+                    'date': f"{self.safe_get(item, 'date', 'month')}/{self.safe_get(item, 'date', 'year')}" if self.safe_get(item,
+                                                                                                              'date') else '',
+                    'entity_urn': self.safe_get(item, 'entityUrn'),
+                }
+                result['test_scores'].append(test_score)
+
+            elif item_type == 'com.linkedin.voyager.identity.profile.Language':
+                language = {
+                    'name': self.safe_get(item, 'name'),
+                    'proficiency': self.safe_get(item, 'proficiency'),
+                    'entity_urn': self.safe_get(item, 'entityUrn'),
+                }
+                result['languages'].append(language)
+
+            elif item_type == 'com.linkedin.voyager.identity.profile.VolunteerExperience':
+                start_date = self.safe_get(item, 'timePeriod', 'startDate', default={})
+                end_date = self.safe_get(item, 'timePeriod', 'endDate', default={})
+                volunteer = {
+                    'role': self.safe_get(item, 'role'),
+                    'organization': self.safe_get(item, 'companyName'),
+                    'cause': self.safe_get(item, 'cause'),
+                    'start_date': f"{self.safe_get(start_date, 'month')}/{self.safe_get(start_date, 'year')}" if start_date else '',
+                    'end_date': f"{self.safe_get(end_date, 'month')}/{self.safe_get(end_date, 'year')}" if end_date else 'Present',
+                    'description': self.safe_get(item, 'description'),
+                    'entity_urn': self.safe_get(item, 'entityUrn'),
+                }
+                result['volunteer_experiences'].append(volunteer)
+
+            elif item_type == 'com.linkedin.voyager.identity.profile.Project':
+                start_date = self.safe_get(item, 'timePeriod', 'startDate', default={})
+                end_date = self.safe_get(item, 'timePeriod', 'endDate', default={})
+                project = {
+                    'title': self.safe_get(item, 'title'),
+                    'description': self.safe_get(item, 'description'),
+                    'start_date': f"{self.safe_get(start_date, 'month')}/{self.safe_get(start_date, 'year')}" if start_date else '',
+                    'end_date': f"{self.safe_get(end_date, 'month')}/{self.safe_get(end_date, 'year')}" if end_date else 'Present',
+                    'url': self.safe_get(item, 'url'),
+                    'entity_urn': self.safe_get(item, 'entityUrn'),
+                }
+                result['projects'].append(project)
+
+            elif item_type == 'com.linkedin.voyager.identity.profile.Publication':
+                publication = {
+                    'title': self.safe_get(item, 'name'),
+                    'publisher': self.safe_get(item, 'publisher'),
+                    'description': self.safe_get(item, 'description'),
+                    'date': f"{self.safe_get(item, 'date', 'month')}/{self.safe_get(item, 'date', 'year')}" if self.safe_get(item,
+                                                                                                              'date') else '',
+                    'url': self.safe_get(item, 'url'),
+                    'entity_urn': self.safe_get(item, 'entityUrn'),
+                }
+                result['publications'].append(publication)
+
+            elif item_type == 'com.linkedin.voyager.identity.profile.Course':
+                course = {
+                    'name': self.safe_get(item, 'name'),
+                    'number': self.safe_get(item, 'number'),
+                    'description': self.safe_get(item, 'description'),
+                    'entity_urn': self.safe_get(item, 'entityUrn'),
+                }
+                result['courses'].append(course)
+
+        # Fetch additional data if needed
+        return result
+    def get_profile_without(
+        self, public_id: Optional[str] = None, urn_id: Optional[str] = None
+    ) -> Dict:
+        """Fetch data for a given LinkedIn profile.
+
+        :param public_id: LinkedIn public ID for a profile
+        :type public_id: str, optional
+        :param urn_id: LinkedIn URN ID for a profile
+        :type urn_id: str, optional
+
+        :return: Profile data
+        :rtype: dict
+        """
+        # NOTE this still works for now, but will probably eventually have to be converted to
+        # https://www.linkedin.com/voyager/api/identity/profiles/ACoAAAKT9JQBsH7LwKaE9Myay9WcX8OVGuDq9Uw
+        res = self._fetch(f"/identity/profiles/{public_id or urn_id}/profileView")
+
+
+        if res.status_code != 200:
+            self.logger.info("request failed: {}".format(res.content))
+            return {}
+        data = res.json()
+        profile=self.extract_linkedin_profile(data)
+
+        return profile
 
     def get_profile_connections(self, urn_id: str, **kwargs) -> List:
         """Fetch connections for a given LinkedIn profile.
