@@ -1,2 +1,3 @@
 flask
 linkedin-api
+pandas
