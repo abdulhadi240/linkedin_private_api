@@ -178,8 +178,8 @@ def scrape_linkedin():
         logger.error(f"Error in scrape_linkedin: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/scrape-linkedin_simple', methods=['POST'])
-def scrape_linkedin():
+@app.route('/scrape-linkedin-simple', methods=['POST'])
+def scrape_linkedin_simple():
     try:
         # Get JSON data from request
         data = request.get_json()
