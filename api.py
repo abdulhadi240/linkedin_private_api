@@ -8,12 +8,15 @@ import logging
 import ast
 import re
 from typing import Dict, Tuple, Optional, List, Union, Any
-from oauth2client.service_account import ServiceAccountCredentials
+from oauth2client.service_account import ServiceAccountCredentials as Oauth2ServiceAccountCredentials # Renamed to avoid conflict
 from datetime import datetime, date
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import threading
 from urllib.parse import urlparse
+import json
+import tempfile
+import os
 
 # === LOGGING SETUP ===
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -28,7 +31,6 @@ app = FastAPI(
 
 # === CONFIGURATION ===
 CONFIG = {
-    "service_account_file": "service_account.json",
     "spreadsheet_accounts": {
         "name": "LinkedIn Accounts",
         "sheet": "LinkedIn Accounts"
@@ -38,8 +40,23 @@ CONFIG = {
 }
 
 # === PYDANTIC MODELS ===
+class ServiceAccountCredentials(BaseModel):
+    """Service account credentials structure"""
+    type: str
+    project_id: str
+    private_key_id: str
+    private_key: str
+    client_email: str
+    client_id: str
+    auth_uri: str
+    token_uri: str
+    auth_provider_x509_cert_url: str
+    client_x509_cert_url: str
+    universe_domain: Optional[str] = "googleapis.com"
+
 class ScrapeRequest(BaseModel):
     linkedin_url: HttpUrl
+    service_account: ServiceAccountCredentials
     
     @validator('linkedin_url')
     def validate_linkedin_url(cls, v):
@@ -56,6 +73,10 @@ class ScrapeResponse(BaseModel):
     account_used: Optional[str] = None
     profile_id: Optional[str] = None
 
+class StatusRequest(BaseModel):
+    batch_id: str
+    service_account: Optional[ServiceAccountCredentials] = None
+
 class StatusResponse(BaseModel):
     batch_id: str
     status: str
@@ -68,11 +89,63 @@ class ProfileIdResponse(BaseModel):
     profile_id: str
     success: bool
 
+class AccountsStatusRequest(BaseModel):
+    service_account: ServiceAccountCredentials
+
 # === GLOBAL VARIABLES ===
-gspread_client = None
 executor = ThreadPoolExecutor(max_workers=5)
 
 # === UTILITY FUNCTIONS ===
+def create_gsheet_client_from_dict(service_account_dict: Dict) -> Optional[gspread.Client]:
+    """Creates a gspread client from service account dictionary."""
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        
+        # Make a mutable copy of the dictionary
+        temp_service_account_dict = service_account_dict.copy()
+
+        # Fix the private_key to ensure actual newlines are present
+        # The incoming private_key from JSON payload will have '\n' as literal backslash-n.
+        # We need to ensure it has actual newlines for the temporary file.
+        if "private_key" in temp_service_account_dict and isinstance(temp_service_account_dict["private_key"], str):
+            # Replace escaped '\n' with actual newline characters
+            temp_service_account_dict["private_key"] = temp_service_account_dict["private_key"].replace("\\n", "\n")
+            
+        temp_file_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as temp_file:
+                json.dump(temp_service_account_dict, temp_file)
+                temp_file_path = temp_file.name
+            
+            logger.info(f"Temporary service account file created at: {temp_file_path}")
+            
+            # --- DEBUGGING STEP: Print content of the temporary file ---
+            try:
+                with open(temp_file_path, 'r') as f_read:
+                    file_content_for_debug = f_read.read()
+                    logger.debug(f"Content of temporary file (for ServiceAccountCredentials.from_json_keyfile_name):\n{file_content_for_debug}")
+            except Exception as read_err:
+                logger.warning(f"Could not read temporary file for debugging: {read_err}")
+            # --- END DEBUGGING STEP ---
+
+            # Use the oauth2client's ServiceAccountCredentials
+            creds = Oauth2ServiceAccountCredentials.from_json_keyfile_name(temp_file_path, scope)
+            client = gspread.authorize(creds)
+            logger.info("Successfully created Google Sheets client from provided service account")
+            return client
+        finally:
+            # Clean up temporary file
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.unlink(temp_file_path)
+                    logger.info(f"Temporary file {temp_file_path} deleted.")
+                except Exception as e:
+                    logger.warning(f"Failed to delete temporary file {temp_file_path}: {e}")
+                
+    except Exception as e:
+        logger.error(f"Failed to authorize with Google Sheets using provided service account: {e}")
+        return None
+
 def extract_profile_id_from_url(linkedin_url: str) -> Optional[str]:
     """
     Extracts the profile ID from a LinkedIn URL.
@@ -111,19 +184,6 @@ def extract_profile_id_from_url(linkedin_url: str) -> Optional[str]:
         
     except Exception as e:
         logger.error(f"Error extracting profile ID from URL {linkedin_url}: {e}")
-        return None
-
-def get_gsheet_client():
-    """Authorizes and returns a gspread client."""
-    try:
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(CONFIG["service_account_file"], scope)
-        return gspread.authorize(creds)
-    except FileNotFoundError:
-        logger.error(f"Service account file not found at: {CONFIG['service_account_file']}")
-        return None
-    except Exception as e:
-        logger.error(f"Failed to authorize with Google Sheets: {e}")
         return None
 
 def parse_cookie(cookie_str: str) -> Dict[str, str]:
@@ -333,16 +393,6 @@ def wait_for_completion(batch_id: str) -> Dict:
     return {"status": "timeout", "result": None, "error": "Batch processing timeout"}
 
 # === API ENDPOINTS ===
-@app.on_event("startup")
-async def startup_event():
-    """Initialize the Google Sheets client on startup."""
-    global gspread_client
-    gspread_client = get_gsheet_client()
-    if not gspread_client:
-        logger.error("Failed to initialize Google Sheets client")
-    else:
-        logger.info("Google Sheets client initialized successfully")
-
 @app.get("/")
 async def root():
     """Root endpoint providing API information."""
@@ -350,11 +400,11 @@ async def root():
         "message": "LinkedIn Scraper API",
         "version": "1.0.0",
         "endpoints": {
-            "scrape": "/scrape - POST - Scrape a LinkedIn profile",
-            "scrape-and-wait": "/scrape-and-wait - POST - Scrape and wait for result",
+            "scrape": "/scrape - POST - Scrape a LinkedIn profile (requires service_account in request)",
+            "scrape-and-wait": "/scrape-and-wait - POST - Scrape and wait for result (requires service_account in request)",
             "extract-profile-id": "/extract-profile-id - POST - Extract profile ID from URL",
-            "status": "/status/{batch_id} - GET - Check scraping status",
-            "accounts-status": "/accounts/status - GET - Check accounts status",
+            "status": "/status - POST - Check scraping status (optionally requires service_account)",
+            "accounts-status": "/accounts/status - POST - Check accounts status (requires service_account)",
             "health": "/health - GET - Health check"
         }
     }
@@ -364,7 +414,6 @@ async def health_check():
     """Health check endpoint."""
     return {
         "status": "healthy",
-        "gsheet_client": gspread_client is not None,
         "timestamp": datetime.now().isoformat()
     }
 
@@ -376,7 +425,8 @@ async def extract_profile_id(request: ScrapeRequest):
     Example:
     POST /extract-profile-id
     {
-        "linkedin_url": "https://www.linkedin.com/in/abdul-hadi-28a46221b/"
+        "linkedin_url": "https://www.linkedin.com/in/abdul-hadi-28a46221b/",
+        "service_account": { ... service account JSON ... }
     }
     
     Response:
@@ -414,7 +464,19 @@ async def scrape_linkedin_profile(request: ScrapeRequest, background_tasks: Back
     Example:
     POST /scrape
     {
-        "linkedin_url": "https://www.linkedin.com/in/abdul-hadi-28a46221b/"
+        "linkedin_url": "https://www.linkedin.com/in/abdul-hadi-28a46221b/",
+        "service_account": {
+            "type": "service_account",
+            "project_id": "your-project-id",
+            "private_key_id": "...",
+            "private_key": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n",
+            "client_email": "...",
+            "client_id": "...",
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_x509_cert_url": "..."
+        }
     }
     
     Response:
@@ -426,10 +488,14 @@ async def scrape_linkedin_profile(request: ScrapeRequest, background_tasks: Back
         "account_used": "Row 2 (Usage: 1/250)"
     }
     """
-    if not gspread_client:
-        raise HTTPException(status_code=500, detail="Google Sheets client not initialized")
-
     try:
+        # Create Google Sheets client from provided service account
+        service_account_dict = request.service_account.dict()
+        gspread_client = create_gsheet_client_from_dict(service_account_dict)
+        
+        if not gspread_client:
+            raise HTTPException(status_code=400, detail="Failed to create Google Sheets client with provided service account")
+
         # Extract profile ID from URL
         linkedin_url = str(request.linkedin_url)
         profile_id = extract_profile_id_from_url(linkedin_url)
@@ -477,7 +543,8 @@ async def scrape_and_wait_for_result(request: ScrapeRequest):
     Example:
     POST /scrape-and-wait
     {
-        "linkedin_url": "https://www.linkedin.com/in/abdul-hadi-28a46221b/"
+        "linkedin_url": "https://www.linkedin.com/in/abdul-hadi-28a46221b/",
+        "service_account": { ... service account JSON ... }
     }
     
     Response:
@@ -490,10 +557,14 @@ async def scrape_and_wait_for_result(request: ScrapeRequest):
         "account_used": "Row 2 (Usage: 1/250)"
     }
     """
-    if not gspread_client:
-        raise HTTPException(status_code=500, detail="Google Sheets client not initialized")
-
     try:
+        # Create Google Sheets client from provided service account
+        service_account_dict = request.service_account.dict()
+        gspread_client = create_gsheet_client_from_dict(service_account_dict)
+        
+        if not gspread_client:
+            raise HTTPException(status_code=400, detail="Failed to create Google Sheets client with provided service account")
+
         # Extract profile ID from URL
         linkedin_url = str(request.linkedin_url)
         profile_id = extract_profile_id_from_url(linkedin_url)
@@ -559,13 +630,17 @@ async def scrape_and_wait_for_result(request: ScrapeRequest):
         logger.error(f"Error in scrape-and-wait endpoint: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-@app.get("/status/{batch_id}", response_model=StatusResponse)
-async def check_batch_status(batch_id: str):
+@app.post("/status", response_model=StatusResponse)
+async def check_batch_status(request: StatusRequest):
     """
     Check the status of a scraping batch.
     
     Example:
-    GET /status/batch_12345
+    POST /status
+    {
+        "batch_id": "batch_12345",
+        "service_account": { ... optional service account JSON ... }
+    }
     
     Response:
     {
@@ -576,6 +651,7 @@ async def check_batch_status(batch_id: str):
     }
     """
     try:
+        batch_id = request.batch_id
         logger.info(f"Checking status for batch: {batch_id}")
         
         response = requests.get(f"{CONFIG['scrape_api']}/scrape-status/{batch_id}", timeout=30)
@@ -590,7 +666,7 @@ async def check_batch_status(batch_id: str):
         )
         
     except requests.exceptions.RequestException as e:
-        logger.error(f"Status check failed for batch {batch_id}: {e}")
+        logger.error(f"Status check failed for batch {request.batch_id}: {e}")
         # Include more detail from the response if available
         error_detail = None
         if hasattr(e, 'response') and e.response is not None:
@@ -607,11 +683,16 @@ async def check_batch_status(batch_id: str):
         logger.error(f"An unexpected error occurred in check_batch_status: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-
-@app.get("/accounts/status")
-async def get_accounts_status():
+@app.post("/accounts/status")
+async def get_accounts_status(request: AccountsStatusRequest):
     """
     Get the status of all LinkedIn accounts including daily usage.
+    
+    Example:
+    POST /accounts/status
+    {
+        "service_account": { ... service account JSON ... }
+    }
     
     Response:
     {
@@ -630,10 +711,14 @@ async def get_accounts_status():
         ]
     }
     """
-    if not gspread_client:
-        raise HTTPException(status_code=500, detail="Google Sheets client not initialized")
-
     try:
+        # Create Google Sheets client from provided service account
+        service_account_dict = request.service_account.dict()
+        gspread_client = create_gsheet_client_from_dict(service_account_dict)
+        
+        if not gspread_client:
+            raise HTTPException(status_code=400, detail="Failed to create Google Sheets client with provided service account")
+
         sheet = gspread_client.open(CONFIG["spreadsheet_accounts"]["name"]).worksheet(CONFIG["spreadsheet_accounts"]["sheet"])
         rows = sheet.get_all_values()
         
@@ -681,6 +766,8 @@ async def get_accounts_status():
             "accounts": accounts_status
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting accounts status: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get accounts status: {str(e)}")
