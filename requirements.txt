@@ -9,3 +9,6 @@ ddgs
 openpyxl 
 xlrd
 gspread
+requests
+oauth2client
+python-dotenv
