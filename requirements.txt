@@ -1,3 +1,10 @@
 flask
 linkedin-api
 pandas
+fastapi 
+uvicorn 
+pydantic 
+httpx 
+ddgs  
+openpyxl 
+xlrd
