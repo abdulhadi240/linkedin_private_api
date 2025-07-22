@@ -7,12 +7,13 @@ import unicodedata
 import logging
 import ast
 import re
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List, Union, Any
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime, date
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import threading
+from urllib.parse import urlparse
 
 # === LOGGING SETUP ===
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -51,20 +52,67 @@ class ScrapeResponse(BaseModel):
     success: bool
     message: str
     batch_id: Optional[str] = None
-    data: Optional[Dict] = None
+    data: Optional[Dict] = None # 'data' here represents the scraped profile data
     account_used: Optional[str] = None
+    profile_id: Optional[str] = None
 
 class StatusResponse(BaseModel):
     batch_id: str
     status: str
-    result: Optional[List[Dict]] = None
+    result: Optional[Dict[str, Any]] = None # 'result' here represents the raw response from the external API
     error: Optional[str] = None
+    profile_id: Optional[str] = None
+
+class ProfileIdResponse(BaseModel):
+    linkedin_url: str
+    profile_id: str
+    success: bool
 
 # === GLOBAL VARIABLES ===
 gspread_client = None
 executor = ThreadPoolExecutor(max_workers=5)
 
 # === UTILITY FUNCTIONS ===
+def extract_profile_id_from_url(linkedin_url: str) -> Optional[str]:
+    """
+    Extracts the profile ID from a LinkedIn URL.
+    
+    Examples:
+    - https://www.linkedin.com/in/abdul-hadi-28a46221b/ -> abdul-hadi-28a46221b
+    - https://linkedin.com/in/john-doe -> john-doe
+    - https://www.linkedin.com/in/company-name/ -> company-name
+    """
+    try:
+        # Parse the URL
+        parsed_url = urlparse(linkedin_url)
+        
+        # Get the path and remove leading/trailing slashes
+        path = parsed_url.path.strip('/')
+        
+        # Split by '/' and look for the profile ID after 'in'
+        path_parts = path.split('/')
+        
+        if 'in' in path_parts:
+            in_index = path_parts.index('in')
+            if in_index + 1 < len(path_parts):
+                profile_id = path_parts[in_index + 1]
+                # Clean up any query parameters or fragments
+                profile_id = profile_id.split('?')[0].split('#')[0]
+                return profile_id
+        
+        # Alternative regex approach for edge cases
+        pattern = r'linkedin\.com/in/([^/?#]+)'
+        match = re.search(pattern, linkedin_url)
+        if match:
+            return match.group(1)
+            
+        logger.warning(f"Could not extract profile ID from URL: {linkedin_url}")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error extracting profile ID from URL {linkedin_url}: {e}")
+        return None
+
 def get_gsheet_client():
     """Authorizes and returns a gspread client."""
     try:
@@ -89,7 +137,7 @@ def parse_cookie(cookie_str: str) -> Dict[str, str]:
         if not isinstance(parsed_dict, dict):
             logger.warning("Parsed data is not a dictionary.")
             return {}
-        
+            
         # Clean the values by stripping extra quotes
         cleaned_dict = {key: str(val).strip('"') for key, val in parsed_dict.items()}
         return cleaned_dict
@@ -204,30 +252,26 @@ def update_account_usage(account: Dict):
         header = sheet.row_values(1)
         daily_use_col_index = header.index("daily_use") + 1  # +1 because gspread uses 1-based indexing
         
-        # Method 1: Use update_cell with numeric indices (recommended)
+        # Update the cell with new daily usage count
         sheet.update_cell(row_index, daily_use_col_index, str(new_daily_use))
-        
-        # Method 2: Alternative using proper column letter conversion (commented out)
-        # daily_use_col_letter = column_index_to_letter(header.index("daily_use"))
-        # sheet.update(f"{daily_use_col_letter}{row_index}", str(new_daily_use))
         
         logger.info(f"Updated account usage: {new_daily_use}/{CONFIG['daily_limit']} for row {row_index}, column {daily_use_col_index}")
     except Exception as e:
         logger.error(f"Failed to update account usage: {e}")
         logger.error(f"Row: {account.get('row_index', 'unknown')}, trying to update daily_use column")
 
-def start_scraping(account: Dict, urls: List[str]) -> Optional[str]:
-    """Initiates a scraping job via the API."""
+def start_scraping(account: Dict, profile_ids: List[str]) -> Optional[str]:
+    """Initiates a scraping job via the API using profile IDs."""
     jsessionid = account["JSESSIONID"].replace("ajax:", "")
 
     payload = {
         "JSESSIONID": jsessionid,
         "li_at": account["li_at"],
-        "profile_urls": urls,
+        "profile_urls": profile_ids,  # Key is 'profile_urls' but values are profile IDs
         "proxy": account["proxy"]
     }
     
-    logger.info(f"Sending API request to {CONFIG['scrape_api']}/scrape-linkedin")
+    logger.info(f"Sending API request to {CONFIG['scrape_api']}/scrape-linkedin with profile IDs: {profile_ids}")
 
     try:
         response = requests.post(f"{CONFIG['scrape_api']}/scrape-linkedin", json=payload, timeout=30)
@@ -241,12 +285,18 @@ def start_scraping(account: Dict, urls: List[str]) -> Optional[str]:
         return batch_id
     except requests.exceptions.RequestException as e:
         logger.error(f"API call to start scraping failed: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                error_detail = e.response.json()
+                logger.error(f"API error response: {error_detail}")
+            except:
+                logger.error(f"API error response text: {e.response.text}")
         return None
 
 def wait_for_completion(batch_id: str) -> Dict:
     """Polls the API to check for the completion of a scraping batch."""
     max_retries = 10
-    wait_interval = 10  # 5 minutes
+    wait_interval = 10  # 10 seconds
 
     for attempt in range(max_retries):
         try:
@@ -258,7 +308,7 @@ def wait_for_completion(batch_id: str) -> Dict:
             status = data.get("status")
             if status == "completed":
                 logger.info(f"Batch {batch_id} completed successfully.")
-                return {"status": "completed", "result": data.get("result", []), "error": None}
+                return {"status": "completed", "result": data, "error": None}
             elif status == "failed":
                 error_msg = data.get('error', 'Unknown error')
                 logger.error(f"Batch {batch_id} failed. Reason: {error_msg}")
@@ -274,7 +324,7 @@ def wait_for_completion(batch_id: str) -> Dict:
             if hasattr(e, 'response') and e.response is not None and 400 <= e.response.status_code < 500:
                 logger.error(f"Client error {e.response.status_code} for batch {batch_id}.")
                 return {"status": "failed", "result": None, "error": f"Client error: {e.response.status_code}"}
-            
+                
             if attempt < max_retries - 1:
                 logger.info(f"Retrying status check for batch {batch_id} after {wait_interval} seconds...")
                 time.sleep(wait_interval)
@@ -301,7 +351,10 @@ async def root():
         "version": "1.0.0",
         "endpoints": {
             "scrape": "/scrape - POST - Scrape a LinkedIn profile",
+            "scrape-and-wait": "/scrape-and-wait - POST - Scrape and wait for result",
+            "extract-profile-id": "/extract-profile-id - POST - Extract profile ID from URL",
             "status": "/status/{batch_id} - GET - Check scraping status",
+            "accounts-status": "/accounts/status - GET - Check accounts status",
             "health": "/health - GET - Health check"
         }
     }
@@ -315,15 +368,77 @@ async def health_check():
         "timestamp": datetime.now().isoformat()
     }
 
+@app.post("/extract-profile-id", response_model=ProfileIdResponse)
+async def extract_profile_id(request: ScrapeRequest):
+    """
+    Extract profile ID from a LinkedIn URL.
+    
+    Example:
+    POST /extract-profile-id
+    {
+        "linkedin_url": "https://www.linkedin.com/in/abdul-hadi-28a46221b/"
+    }
+    
+    Response:
+    {
+        "linkedin_url": "https://www.linkedin.com/in/abdul-hadi-28a46221b/",
+        "profile_id": "abdul-hadi-28a46221b",
+        "success": true
+    }
+    """
+    try:
+        linkedin_url = str(request.linkedin_url)
+        profile_id = extract_profile_id_from_url(linkedin_url)
+        
+        if not profile_id:
+            raise HTTPException(status_code=400, detail="Could not extract profile ID from the provided URL")
+        
+        logger.info(f"Extracted profile ID '{profile_id}' from URL: {linkedin_url}")
+        
+        return ProfileIdResponse(
+            linkedin_url=linkedin_url,
+            profile_id=profile_id,
+            success=True
+        )
+        
+    except Exception as e:
+        logger.error(f"Error extracting profile ID: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
 @app.post("/scrape", response_model=ScrapeResponse)
 async def scrape_linkedin_profile(request: ScrapeRequest, background_tasks: BackgroundTasks):
     """
     Scrape a LinkedIn profile using an available account.
+    Returns a batch_id that can be used to check the scraping status.
+    
+    Example:
+    POST /scrape
+    {
+        "linkedin_url": "https://www.linkedin.com/in/abdul-hadi-28a46221b/"
+    }
+    
+    Response:
+    {
+        "success": true,
+        "message": "Scraping started successfully",
+        "batch_id": "batch_12345",
+        "profile_id": "abdul-hadi-28a46221b",
+        "account_used": "Row 2 (Usage: 1/250)"
+    }
     """
     if not gspread_client:
         raise HTTPException(status_code=500, detail="Google Sheets client not initialized")
 
     try:
+        # Extract profile ID from URL
+        linkedin_url = str(request.linkedin_url)
+        profile_id = extract_profile_id_from_url(linkedin_url)
+        
+        if not profile_id:
+            raise HTTPException(status_code=400, detail="Could not extract profile ID from the provided URL")
+
+        logger.info(f"Starting scrape for profile ID: {profile_id}")
+
         # Find an available account
         account = read_available_account(gspread_client)
         if not account:
@@ -332,9 +447,9 @@ async def scrape_linkedin_profile(request: ScrapeRequest, background_tasks: Back
                 detail="No available accounts found. All accounts have reached their daily limit or are not verified."
             )
 
-        # Start scraping process
-        urls = [str(request.linkedin_url)]
-        batch_id = start_scraping(account, urls)
+        # Start scraping process with profile ID
+        profile_ids = [profile_id]
+        batch_id = start_scraping(account, profile_ids)
         
         if not batch_id:
             raise HTTPException(status_code=500, detail="Failed to start scraping process")
@@ -343,6 +458,7 @@ async def scrape_linkedin_profile(request: ScrapeRequest, background_tasks: Back
             success=True,
             message="Scraping started successfully",
             batch_id=batch_id,
+            profile_id=profile_id,
             account_used=f"Row {account['row_index']} (Usage: {account['daily_use'] + 1}/{CONFIG['daily_limit']})"
         )
 
@@ -357,11 +473,36 @@ async def scrape_and_wait_for_result(request: ScrapeRequest):
     """
     Scrape a LinkedIn profile and wait for the result.
     This endpoint will take longer but returns the complete result.
+    
+    Example:
+    POST /scrape-and-wait
+    {
+        "linkedin_url": "https://www.linkedin.com/in/abdul-hadi-28a46221b/"
+    }
+    
+    Response:
+    {
+        "success": true,
+        "message": "Scraping completed successfully",
+        "batch_id": "batch_12345",
+        "data": { ... scraped profile data ... },
+        "profile_id": "abdul-hadi-28a46221b",
+        "account_used": "Row 2 (Usage: 1/250)"
+    }
     """
     if not gspread_client:
         raise HTTPException(status_code=500, detail="Google Sheets client not initialized")
 
     try:
+        # Extract profile ID from URL
+        linkedin_url = str(request.linkedin_url)
+        profile_id = extract_profile_id_from_url(linkedin_url)
+        
+        if not profile_id:
+            raise HTTPException(status_code=400, detail="Could not extract profile ID from the provided URL")
+
+        logger.info(f"Starting scrape-and-wait for profile ID: {profile_id}")
+
         # Find an available account
         account = read_available_account(gspread_client)
         if not account:
@@ -370,9 +511,9 @@ async def scrape_and_wait_for_result(request: ScrapeRequest):
                 detail="No available accounts found. All accounts have reached their daily limit or are not verified."
             )
 
-        # Start scraping process
-        urls = [str(request.linkedin_url)]
-        batch_id = start_scraping(account, urls)
+        # Start scraping process with profile ID
+        profile_ids = [profile_id]
+        batch_id = start_scraping(account, profile_ids)
         
         if not batch_id:
             raise HTTPException(status_code=500, detail="Failed to start scraping process")
@@ -381,12 +522,26 @@ async def scrape_and_wait_for_result(request: ScrapeRequest):
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(executor, wait_for_completion, batch_id)
         
+        logger.info(f"API result for batch {batch_id}: {result}")
+        
         if result["status"] == "completed":
+            # Extract scraped data from result
+            scraped_data = None
+            if result.get("result"):
+                # Assuming the actual scraped data is under a 'data' key within the 'result' dictionary
+                # or if the external API directly returns the profile data as the result.
+                # Adjust this based on the actual structure of the external API's 'completed' response.
+                if isinstance(result["result"], dict) and "data" in result["result"]:
+                    scraped_data = result["result"]["data"]
+                else:
+                    scraped_data = result["result"] # Fallback if 'data' key isn't present, assume result is the data itself
+            
             return ScrapeResponse(
                 success=True,
                 message="Scraping completed successfully",
                 batch_id=batch_id,
-                data=result["result"][0] if result["result"] else None,
+                data=scraped_data,
+                profile_id=profile_id,
                 account_used=f"Row {account['row_index']} (Usage: {account['daily_use'] + 1}/{CONFIG['daily_limit']})"
             )
         else:
@@ -394,6 +549,7 @@ async def scrape_and_wait_for_result(request: ScrapeRequest):
                 success=False,
                 message=f"Scraping failed: {result.get('error', 'Unknown error')}",
                 batch_id=batch_id,
+                profile_id=profile_id,
                 account_used=f"Row {account['row_index']} (Usage: {account['daily_use'] + 1}/{CONFIG['daily_limit']})"
             )
 
@@ -407,27 +563,72 @@ async def scrape_and_wait_for_result(request: ScrapeRequest):
 async def check_batch_status(batch_id: str):
     """
     Check the status of a scraping batch.
+    
+    Example:
+    GET /status/batch_12345
+    
+    Response:
+    {
+        "batch_id": "batch_12345",
+        "status": "completed",
+        "result": { ... raw response from external API ... },
+        "error": null
+    }
     """
     try:
+        logger.info(f"Checking status for batch: {batch_id}")
+        
         response = requests.get(f"{CONFIG['scrape_api']}/scrape-status/{batch_id}", timeout=30)
         response.raise_for_status()
-        data = response.json()
+        data = response.json() # This 'data' is the entire JSON response from the external API
         
         return StatusResponse(
             batch_id=batch_id,
             status=data.get("status", "unknown"),
-            result=data.get("result"),
+            result=data, # Pass the entire external API response as 'result'
             error=data.get("error")
         )
         
     except requests.exceptions.RequestException as e:
         logger.error(f"Status check failed for batch {batch_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to check batch status: {str(e)}")
+        # Include more detail from the response if available
+        error_detail = None
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                error_detail = e.response.json()
+            except ValueError:
+                error_detail = e.response.text
+        
+        raise HTTPException(
+            status_code=e.response.status_code if hasattr(e, 'response') and e.response is not None else 500, 
+            detail=f"Failed to check batch status: {str(e)}. Response: {error_detail}"
+        )
+    except Exception as e:
+        logger.error(f"An unexpected error occurred in check_batch_status: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
 
 @app.get("/accounts/status")
 async def get_accounts_status():
     """
     Get the status of all LinkedIn accounts including daily usage.
+    
+    Response:
+    {
+        "total_accounts": 5,
+        "available_accounts": 3,
+        "daily_limit": 250,
+        "accounts": [
+            {
+                "row": 2,
+                "verification_status": "verified",
+                "daily_use": 45,
+                "daily_limit": 250,
+                "available": true,
+                "proxy": "proxy_string_preview..."
+            }
+        ]
+    }
     """
     if not gspread_client:
         raise HTTPException(status_code=500, detail="Google Sheets client not initialized")
